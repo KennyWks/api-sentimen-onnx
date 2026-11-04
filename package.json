@@ -1,0 +1,10 @@
+{
+  "name": "api-sentimen-onnx",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node api/sentimen.js"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.16.0"
+  }
+}
