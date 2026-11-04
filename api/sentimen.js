@@ -1,62 +1,58 @@
-const ort = require('onnxruntime-node');
-const path = require('path');
+import path from 'node:path';
+import * as ort from 'onnxruntime-node';
+import { AutoTokenizer, env } from '@xenova/transformers';
 
-// Variabel global untuk menyimpan sesi model agar tidak dimuat ulang 
-// pada setiap permintaan (mengoptimalkan waktu respons/cold start)
-let session = null;
-
-module.exports = async (req, res) => {
-  // Hanya menerima metode POST
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Metode tidak diizinkan. Gunakan POST.' });
-  }
-
-  try {
-    // 1. Muat Model (Hanya jika belum dimuat)
-    if (!session) {
-      // process.cwd() menunjuk ke root direktori proyek saat dijalankan di Vercel
-      const modelPath = path.resolve(process.cwd(), 'model', 'model.onnx');
-      session = await ort.InferenceSession.create(modelPath);
-      console.log('Model ONNX berhasil dimuat.');
+export async function runModel(text) {
+    if (typeof text !== 'string' || !text.trim()) {
+        throw new TypeError('Teks tidak boleh kosong.');
     }
 
-    // 2. Ambil input dari body request (contoh: teks yang sudah diubah ke array token/vektor)
-    // Format JSON yang diharapkan: { "input_data": [0.5, 0.2, 0.1, ...] }
-    const { input_data } = req.body;
+    const modelDirectory = path.resolve(import.meta.dirname, '..', 'model');
+    env.localModelPath = path.dirname(modelDirectory);
+    env.allowRemoteModels = false;
 
-    if (!input_data || !Array.isArray(input_data)) {
-      return res.status(400).json({ error: 'Format input tidak valid. Pastikan mengirim array.' });
-    }
+    const [tokenizer, session] = await Promise.all([
+        AutoTokenizer.from_pretrained('model'),
+        ort.InferenceSession.create(path.join(modelDirectory, 'model.onnx')),
+    ]);
 
-    // 3. Konversi input menjadi Tensor ONNX
-    // Catatan: Tipe data ('float32', 'int64') dan dimensi (shape) HARUS sesuai 
-    // dengan spesifikasi model ONNX Anda saat dilatih.
-    // Contoh di bawah membuat tensor 2D dengan bentuk [1, jumlah_input]
-    const tensor = new ort.Tensor(
-      'float32', 
-      new Float32Array(input_data), 
-      [1, input_data.length] 
+    const tokens = await tokenizer(text, {
+        padding: 'max_length',
+        truncation: true,
+        max_length: 128,
+    });
+    const feeds = Object.fromEntries(
+        session.inputNames.map((name) => {
+            const tensor = tokens[name];
+            if (!tensor) {
+                throw new Error(`Input model "${name}" tidak dihasilkan oleh tokenizer.`);
+            }
+            return [name, new ort.Tensor(tensor.type, tensor.data, tensor.dims)];
+        }),
     );
 
-    // 4. Siapkan feed (sesuaikan kunci dengan nama input layer model Anda)
-    const inputName = session.inputNames[0];
-    const feeds = { [inputName]: tensor };
-
-    // 5. Jalankan inferensi
     const results = await session.run(feeds);
+    
+    // 2. Hitung Probabilitas menggunakan Softmax
+    const probabilities = softmax(results[session.outputNames[0]].data);
+    // console.log("Probabilitas:", probabilities); 
+    
+    // 3. Cari indeks dengan nilai tertinggi (Argmax)
+    const maxIndex = probabilities.indexOf(Math.max(...probabilities));
+    
+    // 4. Petakan indeks ke label
+    const labels = ["Positif", "Netral", "Negatif"];
+    // console.log(`Hasil Prediksi: ${labels[maxIndex]} dengan tingkat keyakinan ${(probabilities[maxIndex] * 100).toFixed(2)}%`);
+    
+    return {
+        label: labels[maxIndex],
+        confidence: (probabilities[maxIndex] * 100).toFixed(2) + '%'
+    }
+}
 
-    // 6. Ambil output
-    const outputName = session.outputNames[0];
-    const outputData = results[outputName].data;
-
-    // Kembalikan respons dalam format JSON (Array.from mengubah Float32Array kembali ke array standar)
-    return res.status(200).json({
-      status: 'sukses',
-      prediksi: Array.from(outputData)
-    });
-
-  } catch (error) {
-    console.error('Terjadi kesalahan inferensi:', error);
-    return res.status(500).json({ error: error.message });
-  }
-};
+function softmax(logits) {
+    const maxLogit = Math.max(...logits); // Untuk stabilitas numerik
+    const scores = logits.map(l => Math.exp(l - maxLogit));
+    const sumScores = scores.reduce((a, b) => a + b, 0);
+    return scores.map(s => s / sumScores);
+}
